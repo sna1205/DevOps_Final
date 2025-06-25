@@ -1,0 +1,88 @@
+---
+- name: Manage Laravel pod:git pull, build, test, backup MySQL
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    namespace: default
+    pod_label_selector: "app=laravel"
+    mysql_root_password: "Hello@123"
+    mysql_database: "veasnakham-db"
+    backup_file: "/tmp/mysql_backup.sql"
+
+  tasks:
+
+    - name: Get running Laravel pod name with label app=laravel
+      shell: >
+        kubectl get pods -n {{ namespace }} -l {{ pod_label_selector }} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}'
+      register: pod_name
+
+    - name: Fail if no running pod found
+      fail:
+        msg: "No running pod with label {{ pod_label_selector }} found in namespace {{ namespace }}"
+      when: pod_name.stdout == ""
+
+    - name: Show selected pod name
+      debug:
+        msg: "Using pod {{ pod_name.stdout }}"
+
+    - name: Check for local git changes inside laravel-web container
+      shell: >
+        kubectl exec -n {{ namespace }} {{ pod_name.stdout }} -c laravel-web -- git status --porcelain
+      register: git_status
+
+    - name: Discard local git changes inside laravel-web container
+      shell: >
+        kubectl exec -n {{ namespace }} {{ pod_name.stdout }} -c laravel-web -- git reset --hard HEAD
+      when: git_status.stdout != ""
+
+    - name: Pull latest git changes inside laravel-web container
+      shell: >
+        kubectl exec -n {{ namespace }} {{ pod_name.stdout }} -c laravel-web -- git pull
+      register: git_pull
+
+    - name: Install composer dependencies inside laravel-web container
+      shell: >
+        kubectl exec -n {{ namespace }} {{ pod_name.stdout }} -c laravel-web -- composer install --no-interaction --prefer-dist --optimize-autoloader
+      environment:
+        COMPOSER_MEMORY_LIMIT: -1
+
+    - name: Install npm dependencies inside laravel-web container
+      shell: >
+        kubectl exec -n {{ namespace }} {{ pod_name.stdout }} -c laravel-web -- npm install
+
+    - name: Build npm assets inside laravel-web container
+      shell: >
+        kubectl exec -n {{ namespace }} {{ pod_name.stdout }} -c laravel-web -- npm run build
+
+    - name: Switch .env to use SQLite for testing inside laravel-web container
+      shell: |
+        kubectl exec -n {{ namespace }} {{ pod_name.stdout }} -c laravel-web -- bash -c "\
+          cp .env .env.backup && \
+          sed -i 's/DB_CONNECTION=mysql/DB_CONNECTION=sqlite/' .env && \
+          sed -i 's|DB_DATABASE=.*|DB_DATABASE=database/database.sqlite|' .env"
+      args:
+        executable: /bin/bash
+
+    - name: Run tests inside laravel-web container (using SQLite)
+      shell: >
+        kubectl exec -n {{ namespace }} {{ pod_name.stdout }} -c laravel-web -- php artisan test
+      register: test_result
+      failed_when: test_result.rc != 0
+
+    - name: Restore original .env after tests inside laravel-web container
+      shell: >
+        kubectl exec -n {{ namespace }} {{ pod_name.stdout }} -c laravel-web -- mv .env.backup .env
+
+    - name: Backup MySQL database inside mysql-db container
+      shell: >
+        kubectl exec -n {{ namespace }} {{ pod_name.stdout }} -c mysql-db -- \
+        mysqldump -uroot -p{{ mysql_root_password }} {{ mysql_database }} > /tmp/mysql_backup.sql
+
+    - name: Copy MySQL backup file from pod to control node
+      shell: >
+        kubectl cp {{ namespace }}/{{ pod_name.stdout }}:/tmp/mysql_backup.sql {{ backup_file }} -c mysql-db
+
+    - name: Inform about backup file location
+      debug:
+        msg: "MySQL database backup saved at {{ backup_file }} on control node"
